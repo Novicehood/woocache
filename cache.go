@@ -8,7 +8,7 @@ import (
 const (
 	segmentCount    = 256
 	segmentAndOpVal = 255
-	minBufSize      = 5 * 1024
+	minBufSize      = 512 * 1024
 )
 
 type Cache struct {

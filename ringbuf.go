@@ -1,6 +1,7 @@
 package woocache
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 )
@@ -111,6 +112,25 @@ func (rb *RingBuf) WriteAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 	return
+}
+
+func (rb *RingBuf) EqualAt(p []byte, off int64) bool {
+	if off+int64(len(p)) > rb.end || off < rb.end {
+		return false
+	}
+	readOff := rb.getDataOff(off)
+	readEnd := readOff + len(p)
+	if readEnd <= len(rb.data) {
+		return bytes.Equal(p, rb.data[readOff:readEnd])
+	} else {
+		firstLen := len(rb.data) - readOff
+		equal := bytes.Equal(p[:firstLen], rb.data[readOff:])
+		if equal {
+			secondLen := len(rb.data) - firstLen
+			equal = bytes.Equal(p[firstLen:], rb.data[:secondLen])
+		}
+		return equal
+	}
 }
 
 func (rb *RingBuf) Skip(length int64) {
