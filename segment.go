@@ -27,6 +27,7 @@ type entryHdr struct {
 	accessTime uint32
 	expireAt   uint32
 	keyLen     uint16
+	hash16     uint16
 	valLen     uint32
 	valCap     uint32
 	deleted    bool
