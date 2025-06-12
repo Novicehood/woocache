@@ -123,7 +123,63 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 			hdr.valCap = 1
 		}
 	}
-	//TODO
+
+	entryLen := ENTRY_HDR_SIZE + int64(len(key)) + int64(hdr.valCap)
+	slotModified := seg.evacuate(entryLen, slotId, now)
+	if slotModified {
+		slot := seg.getSlot(slotId)
+		idx, match = seg.lookup(slot, hash16, key)
+	}
+	newOff := seg.rb.End()
+	seg.insertEntryPtr(slotId, hash16, newOff, idx, hdr.keyLen)
+	seg.rb.Write(hdrBuf[:])
+	seg.rb.Write(key)
+	seg.rb.Write(value)
+	seg.rb.Skip(int64(hdr.valCap - hdr.valLen))
+	atomic.AddInt64(&seg.totalTime, int64(now))
+	atomic.AddInt64(&seg.totalCount, 1)
+	seg.vacuumLen -= entryLen
+	return
+}
+
+func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModified bool) {
+	var oldHdrBuf [ENTRY_HDR_SIZE]byte
+	consecutiveEvacuate := 0
+	for seg.vacuumLen < entryLen {
+		oldOff := seg.vacuumLen + seg.rb.End() - seg.rb.Size()
+		seg.rb.ReadAt(oldHdrBuf[:], oldOff)
+		oldHdr := (*entryHdr)(unsafe.Pointer(&oldHdrBuf[0]))
+		oldEntryLen := ENTRY_HDR_SIZE + int64(oldHdr.keyLen) + int64(oldHdr.valCap)
+		if oldHdr.deleted {
+			consecutiveEvacuate = 0
+			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
+			atomic.AddInt64(&seg.totalCount, -1)
+			seg.vacuumLen += oldEntryLen
+			continue
+		}
+		expired := isExpired(oldHdr.expireAt, now)
+		leastRecentUsed := int64(oldHdr.accessTime)*atomic.LoadInt64(&seg.totalCount) <= atomic.LoadInt64(&seg.totalTime)
+		if expired || leastRecentUsed || consecutiveEvacuate > 5 {
+			seg.delEntryPtrByOffset(oldHdr.slotId, oldHdr.hash16, oldOff)
+			if oldHdr.slotId == slotId {
+				slotModified = true
+			}
+			consecutiveEvacuate = 0
+			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
+			atomic.AddInt64(&seg.totalCount, -1)
+			seg.vacuumLen += oldEntryLen
+			if expired {
+				atomic.AddUint64(&seg.totalExpired, 1)
+			} else {
+				atomic.AddUint64(&seg.totalEvacuate, 1)
+			}
+		} else {
+			newOff := seg.rb.Evacuate(oldOff, int(oldEntryLen))
+			seg.updateEntryPtr(oldHdr.slotId, oldHdr.hash16, oldOff, newOff)
+			consecutiveEvacuate++
+			atomic.AddUint64(&seg.totalEvacuate, 1)
+		}
+	}
 	return
 }
 
@@ -135,6 +191,22 @@ func (seg *segment) lookup(slot []entryPtr, hash16 uint16, key []byte) (idx int,
 			break
 		}
 		match := int(ptr.keyLen) == len(key) && seg.rb.EqualAt(key, ptr.offset+ENTRY_HDR_SIZE)
+		if match {
+			return
+		}
+		idx++
+	}
+	return
+}
+
+func (seg *segment) lookupByOffset(slot []entryPtr, hash16 uint16, offset int64) (idx int, match bool) {
+	idx = entryPtrIdx(slot, hash16)
+	for idx < len(slot) {
+		ptr := &slot[idx]
+		if ptr.hash16 != hash16 {
+			break
+		}
+		match = offset == ptr.offset
 		if match {
 			return
 		}
@@ -157,6 +229,26 @@ func entryPtrIdx(slot []entryPtr, hash16 uint16) (idx int) {
 	return
 }
 
+func (seg *segment) expand() {
+	newSlotData := make([]entryPtr, seg.slotCap*2*256)
+	for i := 0; i < 256; i++ {
+		off := int32(i) * seg.slotCap
+		copy(newSlotData[2*off:], seg.slotsData[off:off+seg.slotLens[i]])
+	}
+	seg.slotCap *= 2
+	seg.slotsData = newSlotData
+}
+
+func (seg *segment) updateEntryPtr(slotId uint8, hash16 uint16, oldOff int64, newOff int64) {
+	slot := seg.getSlot(slotId)
+	idx, match := seg.lookupByOffset(slot, hash16, oldOff)
+	if !match {
+		return
+	}
+	ptr := &slot[idx]
+	ptr.offset = newOff
+}
+
 func (seg *segment) delEntryPtr(slotId uint8, slot []entryPtr, idx int) {
 	offset := slot[idx].offset
 	var entryHdrBuf [ENTRY_HDR_SIZE]byte
@@ -165,9 +257,30 @@ func (seg *segment) delEntryPtr(slotId uint8, slot []entryPtr, idx int) {
 	entryHdr.deleted = true
 	seg.rb.WriteAt(entryHdrBuf[:], offset)
 	copy(slot[idx:], slot[idx+1:])
-	seg.slotLens[idx]--
+	seg.slotLens[slotId]--
 	atomic.AddInt64(&seg.entryCount, -1)
-	return
+}
+
+func (seg *segment) delEntryPtrByOffset(slotId uint8, hash16 uint16, offset int64) {
+	slot := seg.getSlot(slotId)
+	idx, match := seg.lookupByOffset(slot, hash16, offset)
+	if !match {
+		return
+	}
+	seg.delEntryPtr(slotId, slot, idx)
+}
+
+func (seg *segment) insertEntryPtr(slotId uint8, hash16 uint16, offset int64, idx int, keyLen uint16) {
+	if seg.slotLens[slotId] == seg.slotCap {
+		seg.expand()
+	}
+	seg.slotLens[slotId]++
+	atomic.AddInt64(&seg.entryCount, 1)
+	slot := seg.getSlot(slotId)
+	copy(slot[idx+1:], slot[idx:])
+	slot[idx].hash16 = hash16
+	slot[idx].offset = offset
+	slot[idx].keyLen = keyLen
 }
 
 func (seg *segment) getSlot(slotId uint8) []entryPtr {

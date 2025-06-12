@@ -143,3 +143,44 @@ func (rb *RingBuf) Skip(length int64) {
 		rb.begin = rb.end - int64(len(rb.data))
 	}
 }
+
+func (rb *RingBuf) Evacuate(off int64, length int) (newOff int64) {
+	if off+int64(length) > rb.end || off < rb.begin {
+		return -1
+	}
+	readOff := rb.getDataOff(off)
+	if readOff == rb.index {
+		rb.index += length
+		if rb.index >= len(rb.data) {
+			rb.index -= len(rb.data)
+		}
+	} else if readOff < rb.index {
+		var n = copy(rb.data[rb.index:], rb.data[readOff:readOff+length])
+		rb.index += n
+		if rb.index == len(rb.data) {
+			rb.index = copy(rb.data, rb.data[readOff:readOff+length])
+		}
+	} else {
+		var readEnd = readOff + length
+		var n int
+		if readEnd <= len(rb.data) {
+			n = copy(rb.data[rb.index:], rb.data[readOff:readEnd])
+			rb.index += n
+		} else {
+			n = copy(rb.data[rb.index:], rb.data[readOff:])
+			rb.index += n
+			var tail = length - n
+			n = copy(rb.data[rb.index:], rb.data[:tail])
+			rb.index += n
+			if rb.index == len(rb.data) {
+				rb.index = copy(rb.data, rb.data[n:tail])
+			}
+		}
+	}
+	newOff = rb.end
+	rb.end += int64(length)
+	if rb.begin < rb.end-int64(len(rb.data)) {
+		rb.begin = rb.end - int64(len(rb.data))
+	}
+	return
+}
