@@ -142,6 +142,100 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	return
 }
 
+func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (val []byte, expireAt uint32, err error) {
+	hdr, hdrOffset, err := seg.locate(key, hashVal, peek)
+	if err != nil {
+		return
+	}
+	expireAt = hdr.expireAt
+	if cap(buf) >= int(hdr.valLen) {
+		val = buf[:hdr.valLen]
+	} else {
+		val = make([]byte, hdr.valLen)
+	}
+	seg.rb.ReadAt(val, hdrOffset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+	if !peek {
+		atomic.AddInt64(&seg.hitCount, 1)
+	}
+	return
+}
+
+func (seg *segment) del(key []byte, hashVal uint64) (affected bool) {
+	slotId := uint8(hashVal >> 8)
+	hash16 := uint16(hashVal >> 16)
+	slot := seg.getSlot(slotId)
+	idx, match := seg.lookup(slot, hash16, key)
+	if !match {
+		return false
+	}
+	seg.delEntryPtr(slotId, slot, idx)
+	return true
+}
+
+func (seg *segment) touch(key []byte, hashVal uint64, expireSeconds int) (err error) {
+	if len(key) > 65535 {
+		return ErrLargeKey
+	}
+	slotId := uint8(hashVal >> 8)
+	hash16 := uint16(hashVal >> 16)
+	slot := seg.getSlot(slotId)
+	idx, match := seg.lookup(slot, hash16, key)
+	if !match {
+		err = ErrNotFound
+		return
+	}
+	ptr := &slot[idx]
+	var hdrBuf [ENTRY_HDR_SIZE]byte
+	seg.rb.ReadAt(hdrBuf[:], ptr.offset)
+	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
+	now := seg.timer.Now()
+	if isExpired(hdr.expireAt, now) {
+		seg.delEntryPtr(slotId, slot, idx)
+		atomic.AddUint64(&seg.totalExpired, 1)
+		err = ErrNotFound
+		atomic.AddInt64(&seg.missCount, 1)
+		return
+	}
+	expireAt := uint32(0)
+	if expireSeconds > 0 {
+		expireAt = uint32(expireSeconds) + now
+	}
+	hdr.expireAt = expireAt
+	originAccessTime := hdr.accessTime
+	hdr.accessTime = now
+	atomic.AddInt64(&seg.totalTime, int64(now)-int64(originAccessTime))
+	seg.rb.WriteAt(hdrBuf[:], ptr.offset)
+	atomic.AddUint64(&seg.touched, 1)
+	return
+}
+
+func (seg *segment) ttl(key []byte, hashVal uint64) (timeLeft uint32, err error) {
+	slotId := uint8(hashVal >> 8)
+	hash16 := uint16(hashVal >> 16)
+	slot := seg.getSlot(slotId)
+	idx, match := seg.lookup(slot, hash16, key)
+	if !match {
+		err = ErrNotFound
+		return
+	}
+	var hdrBuf [ENTRY_HDR_SIZE]byte
+	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
+	ptr := &slot[idx]
+	expireAt := hdr.expireAt
+	seg.rb.ReadAt(hdrBuf[:], ptr.offset)
+
+	if expireAt == 0 {
+		return
+	}
+	now := seg.timer.Now()
+	if isExpired(hdr.expireAt, now) {
+		err = ErrNotFound
+		return
+	}
+	timeLeft = now - expireAt
+	return
+}
+
 func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModified bool) {
 	var oldHdrBuf [ENTRY_HDR_SIZE]byte
 	consecutiveEvacuate := 0
@@ -179,6 +273,56 @@ func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModi
 			consecutiveEvacuate++
 			atomic.AddUint64(&seg.totalEvacuate, 1)
 		}
+	}
+	return
+}
+
+func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdrEntry entryHdr, ptrOffset int64, err error) {
+	slotId := uint8(hashVal >> 8)
+	hash16 := uint16(hashVal) >> 16
+	slot := seg.getSlot(slotId)
+	idx, match := seg.lookup(slot, hash16, key)
+	if !match {
+		err = ErrNotFound
+		if !peek {
+			atomic.AddInt64(&seg.missCount, 1)
+			return
+		}
+	}
+	ptr := &slot[idx]
+	var hdrBuf [ENTRY_HDR_SIZE]byte
+	seg.rb.ReadAt(hdrBuf[:], ptr.offset)
+	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
+	if !peek {
+		now := seg.timer.Now()
+		//惰性删除
+		if isExpired(hdr.expireAt, now) {
+			seg.delEntryPtr(slotId, slot, idx)
+			atomic.AddUint64(&seg.totalExpired, 1)
+			err = ErrNotFound
+			atomic.AddInt64(&seg.missCount, 1)
+			return
+		}
+		atomic.AddInt64(&seg.totalTime, int64(now-hdr.accessTime))
+		hdr.accessTime = now
+		seg.rb.WriteAt(hdrBuf[:], ptr.offset)
+	}
+	return *hdr, ptr.offset, nil
+}
+
+func (seg *segment) view(key []byte, fn func([]byte) error, hashVal uint64, peek bool) (err error) {
+	hdr, hdrOffset, err := seg.locate(key, hashVal, peek)
+	if err != nil {
+		return err
+	}
+	start := hdrOffset + ENTRY_HDR_SIZE + int64(hdr.keyLen)
+	val, err := seg.rb.Slice(start, int64(hdr.valLen))
+	if err != nil {
+		return err
+	}
+	err = fn(val)
+	if !peek {
+		atomic.AddInt64(&seg.hitCount, 1)
 	}
 	return
 }

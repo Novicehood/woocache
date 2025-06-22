@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 )
 
 var ErrOutOfRange = errors.New("out of range")
@@ -55,12 +56,40 @@ func (rb *RingBuf) ReadAt(p []byte, off int64) (n int, e error) {
 		e = ErrOutOfRange
 		return
 	}
-	return 0, nil
+	readOff := rb.getDataOff(off)
+	readEnd := readOff + int(rb.end-off)
+	if readEnd <= len(rb.data) {
+		copy(p, rb.data[readOff:readEnd])
+	} else {
+		n = copy(p, rb.data[readOff:])
+		if n < len(p) {
+			n += copy(p[n:], rb.data[:readEnd-len(rb.data)])
+		}
+	}
+	if n < len(p) {
+		e = io.EOF
+	}
+	return
 }
 
-// TODO
 func (rb *RingBuf) Slice(off, length int64) ([]byte, error) {
-	return nil, nil
+	if off > rb.end || off < rb.begin {
+		return nil, ErrOutOfRange
+	}
+	readOff := rb.getDataOff(off)
+	readEnd := readOff + int(length)
+	if readEnd <= len(rb.data) {
+		return rb.data[off:readEnd], nil
+	}
+	buf := make([]byte, length)
+	n := copy(buf, rb.data[off:])
+	if n < len(rb.data) {
+		n += copy(buf[n:], rb.data[:readEnd-len(rb.data)])
+	}
+	if n < int(length) {
+		return nil, io.EOF
+	}
+	return buf, nil
 }
 
 func (rb *RingBuf) getDataOff(off int64) int {
